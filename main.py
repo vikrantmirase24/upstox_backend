@@ -15,6 +15,7 @@ from apscheduler.triggers.cron import CronTrigger
 import database as db
 import broker_service
 import strategy_engine
+import seed_stocks
 
 
 # ============================================================
@@ -172,6 +173,28 @@ def seed_default_admin():
 
             session.add(new_admin)
             session.commit()
+
+    finally:
+        session.close()
+
+
+@app.on_event("startup")
+def seed_stock_master_if_empty():
+    """Agar stock_master empty hai to startup par stock list auto-seed ho jayegi."""
+    session = db.SessionLocal()
+
+    try:
+        stock_count = session.query(db.StockMaster).count()
+
+        if stock_count > 0:
+            print(f"[STARTUP] stock_master already contains {stock_count} records. Skipping seed.")
+            return
+
+        print("[STARTUP] stock_master is empty. Seeding stock list...")
+        seed_stocks.seed_stocks()
+
+    except Exception as exc:
+        print(f"[STARTUP STOCK SEED ERROR] {exc}")
 
     finally:
         session.close()

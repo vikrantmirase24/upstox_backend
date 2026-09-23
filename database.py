@@ -1,6 +1,7 @@
 import os
 import datetime
 import pytz
+from dotenv import load_dotenv
 from sqlalchemy import (
     Column,
     Integer,
@@ -12,7 +13,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL") or "sqlite:///./copy_algo_trader.db"
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable is not set")
