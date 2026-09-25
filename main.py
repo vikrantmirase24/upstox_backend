@@ -234,14 +234,66 @@ class WatchlistCreateRequest(BaseModel):
 # AUTOMATIC EXECUTION ENGINE
 # ============================================================
 
-def get_live_price(symbol: str, fallback: float = 1000.0):
+def get_symbol_seed_price(symbol: str) -> float:
     """
-    Realtime LTP fetch karta hai. Upstox fail hota hai to fallback use hota hai.
+    Live data unavailable hone par ek deterministic symbol-based fallback price.
+    Har symbol ka price same 1000 nahi rahega.
+    """
+    text = (symbol or "").upper().strip()
+    if not text:
+        return 1000.0
+
+    seed = sum(ord(ch) for ch in text)
+    return float(200.0 + (seed % 4500) + (seed % 13) * 25.0)
+
+
+def build_symbol_candles(symbol: str, current_price: Optional[float] = None) -> pd.DataFrame:
+    """
+    Symbol-specific dummy OHLC generator.
+    Har stock ke liye alag trend data banta hai, taaki 1000 fixed mock price na ho.
+    """
+    base_price = float(current_price) if current_price is not None else get_symbol_seed_price(symbol)
+    seed = sum(ord(ch) for ch in (symbol or "").upper())
+
+    trend = ((seed % 11) - 5) * 0.006
+    opens = [
+        base_price * (1 - 0.022 + (i * 0.006) + trend)
+        for i in range(5)
+    ]
+    closes = [
+        base_price * (1 - 0.012 + (i * 0.005) + trend + ((seed + i) % 5) * 0.0008)
+        for i in range(5)
+    ]
+    highs = [
+        max(o, c) * (1 + 0.004 + ((seed + i) % 7) * 0.0007)
+        for i, (o, c) in enumerate(zip(opens, closes))
+    ]
+    lows = [
+        min(o, c) * (1 - 0.004 - ((seed + i) % 6) * 0.0008)
+        for i, (o, c) in enumerate(zip(opens, closes))
+    ]
+
+    return pd.DataFrame(
+        {
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "close": closes,
+        }
+    )
+
+
+def get_live_price(symbol: str, fallback: Optional[float] = None):
+    """
+    Realtime LTP fetch karta hai. Upstox fail hota hai to symbol-specific fallback use hota hai.
+    1000 static fallback ko intentionally avoid kiya gaya hai taaki har stock alag price dekha ja sake.
     """
     live_price = broker_service.get_live_ltp(symbol)
     if live_price is not None:
         return float(live_price)
-    return float(fallback)
+    if fallback is not None:
+        return float(fallback)
+    return get_symbol_seed_price(symbol)
 
 
 def update_user_open_position_capital(session: Session, user):
@@ -323,7 +375,7 @@ def run_auto_920_entry():
         num_stocks = len(stocks)
 
         live_ltps = {
-            st.symbol: get_live_price(st.symbol, 1000.0)
+            st.symbol: get_live_price(st.symbol)
             for st in stocks
         }
 
@@ -345,7 +397,7 @@ def run_auto_920_entry():
 
             for st in stocks:
 
-                cmp = live_ltps.get(st.symbol, 1000.0)
+                cmp = live_ltps.get(st.symbol, get_symbol_seed_price(st.symbol))
                 target_notional = capital_per_stock * leverage
                 qty = max(1, int(target_notional // cmp))
 
@@ -440,46 +492,15 @@ def run_auto_supertrend_exit_check():
 
         for sym in unique_symbols:
 
-            # ------------------------------------------------
-            # Mock 5-min OHLC
-            # ------------------------------------------------
+            current_price = get_live_price(sym)
+            if current_price is None:
+                continue
 
-            mock_candles = pd.DataFrame(
-                {
-                    "open": [
-                        1520,
-                        1530,
-                        1535,
-                        1528,
-                        1510,
-                    ],
-                    "high": [
-                        1535,
-                        1545,
-                        1540,
-                        1532,
-                        1515,
-                    ],
-                    "low": [
-                        1515,
-                        1525,
-                        1526,
-                        1505,
-                        1500,
-                    ],
-                    "close": [
-                        1530,
-                        1538,
-                        1529,
-                        1508,
-                        1502,
-                    ],
-                }
-            )
+            symbol_candles = build_symbol_candles(sym, current_price)
 
             st_data = (
                 strategy_engine.calculate_supertrend(
-                    mock_candles,
+                    symbol_candles,
                     period=1,
                     multiplier=1.0,
                 )
@@ -494,7 +515,7 @@ def run_auto_supertrend_exit_check():
             if is_red:
 
                 next_open_price = (
-                    mock_candles["open"].iloc[-1]
+                    symbol_candles["open"].iloc[-1]
                 )
 
                 matching_trades = (
@@ -877,12 +898,9 @@ def trigger_daily_trades(
 
     current_time_str = get_current_time()
 
-    mock_prices = {
-        stocks[0].symbol: 1500.0,
-        stocks[1].symbol: 850.0,
-        stocks[2].symbol: 2400.0,
-        stocks[3].symbol: 420.0,
-        stocks[4].symbol: 3100.0,
+    symbol_prices = {
+        stock.symbol: get_symbol_seed_price(stock.symbol)
+        for stock in stocks
     }
 
     for user in users:
@@ -898,9 +916,9 @@ def trigger_daily_trades(
 
         for stock in stocks:
 
-            cmp = mock_prices.get(
+            cmp = symbol_prices.get(
                 stock.symbol,
-                1000.0,
+                get_symbol_seed_price(stock.symbol),
             )
 
             qty = max(
@@ -1733,12 +1751,9 @@ def trigger_920_entry(
 
     buy_time = get_current_time()
 
-    mock_ltps = {
-        stocks[0].symbol: 1540.0,
-        stocks[1].symbol: 825.0,
-        stocks[2].symbol: 2450.0,
-        stocks[3].symbol: 410.0,
-        stocks[4].symbol: 3180.0,
+    symbol_prices = {
+        stock.symbol: get_symbol_seed_price(stock.symbol)
+        for stock in stocks
     }
 
     for user in users:
@@ -1754,9 +1769,9 @@ def trigger_920_entry(
 
         for st in stocks:
 
-            cmp = mock_ltps.get(
+            cmp = symbol_prices.get(
                 st.symbol,
-                1000.0,
+                get_symbol_seed_price(st.symbol),
             )
 
             qty = max(
@@ -1854,42 +1869,15 @@ def check_supertrend_exit(
 
     for sym in unique_symbols:
 
-        mock_candles = pd.DataFrame(
-            {
-                "open": [
-                    1520,
-                    1530,
-                    1535,
-                    1528,
-                    1510,
-                ],
-                "high": [
-                    1535,
-                    1545,
-                    1540,
-                    1532,
-                    1515,
-                ],
-                "low": [
-                    1515,
-                    1525,
-                    1526,
-                    1505,
-                    1500,
-                ],
-                "close": [
-                    1530,
-                    1538,
-                    1529,
-                    1508,
-                    1502,
-                ],
-            }
-        )
+        current_price = get_live_price(sym)
+        if current_price is None:
+            continue
+
+        symbol_candles = build_symbol_candles(sym, current_price)
 
         st_data = (
             strategy_engine.calculate_supertrend(
-                mock_candles,
+                symbol_candles,
                 period=1,
                 multiplier=1.0,
             )
@@ -1902,7 +1890,7 @@ def check_supertrend_exit(
         if is_red:
 
             next_open_price = (
-                mock_candles["open"].iloc[-1]
+                symbol_candles["open"].iloc[-1]
             )
 
             matching_trades = (
