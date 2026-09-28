@@ -58,6 +58,24 @@ def get_current_time():
     return datetime.now(IST).strftime("%I:%M:%S %p")
 
 
+def build_execution_error(
+    message: str,
+    reason: str,
+    status_code: int = 400,
+    details: Optional[dict] = None,
+):
+    """Standard error payload for execution APIs and scheduler-trigger failures."""
+    payload = {
+        "success": False,
+        "message": message,
+        "reason": reason,
+        "status_code": status_code,
+    }
+    if details:
+        payload["details"] = details
+    raise HTTPException(status_code=status_code, detail=payload)
+
+
 # ============================================================
 # DATABASE
 # ============================================================
@@ -358,7 +376,7 @@ def run_auto_920_entry():
 
         if not stocks:
             print(
-                f"[AUTO 9:20 AM] Aaj ({today}) koi active stock nahi mila."
+                f"[AUTO 9:20 AM] No execution: no ACTIVE watchlist stocks found for {today}."
             )
             return
 
@@ -370,6 +388,12 @@ def run_auto_920_entry():
             )
             .all()
         )
+
+        if not users:
+            print(
+                f"[AUTO 9:20 AM] No execution: no active CLIENT users found for {today}."
+            )
+            return
 
         buy_time = get_current_time()
         num_stocks = len(stocks)
@@ -477,6 +501,7 @@ def run_auto_supertrend_exit_check():
         )
 
         if not open_trades:
+            print("[AUTO ST EXIT] No execution: no OPEN trades found for exit check.")
             return
 
         exit_time = get_current_time()
@@ -1547,23 +1572,27 @@ def trigger_orders(
     )
 
     if not item:
-
-        raise HTTPException(
+        build_execution_error(
+            message="Execution failed: stock not found in today's watchlist.",
+            reason="The selected stock is missing from today's ACTIVE watchlist, so no trade could be triggered.",
             status_code=404,
-            detail=(
-                "Stock not found in "
-                "today's watchlist"
-            ),
+            details={
+                "item_id": item_id,
+                "date": today,
+                "expected_status": "ACTIVE",
+            },
         )
 
     if item.status != "ACTIVE":
-
-        raise HTTPException(
+        build_execution_error(
+            message=f"Execution failed: stock status is {item.status}.",
+            reason="Only ACTIVE stocks can be triggered for execution.",
             status_code=400,
-            detail=(
-                f"Stock status is {item.status}. "
-                f"Only ACTIVE stocks can be triggered."
-            ),
+            details={
+                "symbol": item.symbol,
+                "current_status": item.status,
+                "required_status": "ACTIVE",
+            },
         )
 
     clients = (
@@ -1575,39 +1604,67 @@ def trigger_orders(
         .all()
     )
 
+    if not clients:
+        build_execution_error(
+            message="Execution failed: no active client accounts are available.",
+            reason="There are no CLIENT users with is_active=True, so the trigger had nobody to execute against.",
+            status_code=400,
+            details={
+                "symbol": item.symbol,
+                "watchlist_status": item.status,
+            },
+        )
+
+    skipped_clients = []
+    executed_clients = 0
+
     for client in clients:
+        if not client.broker_account:
+            skipped_clients.append({
+                "client_id": client.id,
+                "name": client.name,
+                "reason": "No broker account configured",
+            })
+            continue
 
-        if client.broker_account:
+        calculated_qty = int(
+            item.base_qty
+            * client.risk_multiplier
+        )
 
-            calculated_qty = int(
-                item.base_qty
-                * client.risk_multiplier
-            )
-
-            broker_service.execute_user_order(
-                client_id=(
-                    client.broker_account.client_id
-                ),
-                broker=(
-                    client.broker_account.broker_name
-                ),
-                symbol=item.symbol,
-                qty=max(
-                    1,
-                    calculated_qty,
-                ),
-                action=item.action,
-            )
+        broker_service.execute_user_order(
+            client_id=(
+                client.broker_account.client_id
+            ),
+            broker=(
+                client.broker_account.broker_name
+            ),
+            symbol=item.symbol,
+            qty=max(
+                1,
+                calculated_qty,
+            ),
+            action=item.action,
+        )
+        executed_clients += 1
 
     item.status = "TRIGGERED"
 
     s.commit()
 
     return {
+        "success": True,
         "message": (
-            f"Orders executed across "
-            f"{len(clients)} active accounts"
-        )
+            f"Execution triggered for {item.symbol}. "
+            f"{executed_clients} active account(s) processed."
+        ),
+        "data": {
+            "symbol": item.symbol,
+            "status": item.status,
+            "executed_clients": executed_clients,
+            "skipped_clients": skipped_clients,
+            "total_clients_checked": len(clients),
+        },
     }
 
 
@@ -1730,14 +1787,18 @@ def trigger_920_entry(
     )
 
     if len(stocks) < 5:
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Kam se kam 5 active stocks "
-                f"today's list me hone chahiye! "
-                f"Abhi {len(stocks)} hain."
+        build_execution_error(
+            message="9:20 execution failed: not enough active stocks were available.",
+            reason=(
+                "At least 5 ACTIVE stocks are required for the 9:20 auto-entry. "
+                f"Only {len(stocks)} stock(s) were found in today's watchlist."
             ),
+            status_code=400,
+            details={
+                "required_active_stocks": 5,
+                "found_active_stocks": len(stocks),
+                "date": today,
+            },
         )
 
     users = (
@@ -1748,6 +1809,17 @@ def trigger_920_entry(
         )
         .all()
     )
+
+    if not users:
+        build_execution_error(
+            message="9:20 execution failed: no active clients available.",
+            reason="No CLIENT accounts with is_active=True were found, so the buy trigger had no recipients.",
+            status_code=400,
+            details={
+                "date": today,
+                "required_role": "CLIENT",
+            },
+        )
 
     buy_time = get_current_time()
 
@@ -1849,9 +1921,13 @@ def check_supertrend_exit(
     )
 
     if not open_trades:
-
         return {
-            "message": "Koi open trade nahi hai."
+            "success": False,
+            "message": "Exit check did not execute: no open trades are available to exit.",
+            "reason": "There are zero OPEN trades in the system right now, so no exit was triggered.",
+            "data": {
+                "open_trade_count": 0,
+            },
         }
 
     exit_time = get_current_time()
