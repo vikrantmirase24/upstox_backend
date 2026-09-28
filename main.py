@@ -1360,7 +1360,8 @@ def get_watchlist(
     stocks = (
         s.query(db.DailyWatchlist)
         .filter(
-            db.DailyWatchlist.date == today
+            db.DailyWatchlist.date == today,
+            db.DailyWatchlist.status.in_(["ACTIVE", "TRIGGERED"]),
         )
         .order_by(
             db.DailyWatchlist.id.asc()
