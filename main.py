@@ -1,6 +1,5 @@
 from datetime import datetime
 from typing import List, Optional
-import random
 import pytz
 import pandas as pd
 
@@ -301,17 +300,14 @@ def build_symbol_candles(symbol: str, current_price: Optional[float] = None) -> 
     )
 
 
-def get_live_price(symbol: str, fallback: Optional[float] = None):
+def get_live_price(symbol: str) -> Optional[float]:
     """
-    Realtime LTP fetch karta hai. Upstox fail hota hai to symbol-specific fallback use hota hai.
-    1000 static fallback ko intentionally avoid kiya gaya hai taaki har stock alag price dekha ja sake.
+    Realtime LTP fetch karta hai; missing quote ko unavailable hi rakhta hai.
     """
     live_price = broker_service.get_live_ltp(symbol)
     if live_price is not None:
         return float(live_price)
-    if fallback is not None:
-        return float(fallback)
-    return get_symbol_seed_price(symbol)
+    return None
 
 
 def update_user_open_position_capital(session: Session, user):
@@ -334,7 +330,9 @@ def update_user_open_position_capital(session: Session, user):
     total_unrealized_pnl = 0.0
 
     for trade in open_trades:
-        live_price = get_live_price(trade.symbol, trade.buy_price)
+        live_price = get_live_price(trade.symbol)
+        if live_price is None:
+            return
         total_unrealized_pnl += (live_price - trade.buy_price) * trade.quantity
 
     user.current_capital = round(
@@ -402,6 +400,15 @@ def run_auto_920_entry():
             st.symbol: get_live_price(st.symbol)
             for st in stocks
         }
+        unavailable_symbols = [
+            symbol for symbol, price in live_ltps.items() if price is None
+        ]
+        if unavailable_symbols:
+            print(
+                "[AUTO 9:20 AM] No execution: live quotes unavailable for "
+                + ", ".join(unavailable_symbols)
+            )
+            return
 
         # ----------------------------------------------------
         # Deploy trades
@@ -421,7 +428,7 @@ def run_auto_920_entry():
 
             for st in stocks:
 
-                cmp = live_ltps.get(st.symbol, get_symbol_seed_price(st.symbol))
+                cmp = live_ltps[st.symbol]
                 target_notional = capital_per_stock * leverage
                 qty = max(1, int(target_notional // cmp))
 
@@ -656,7 +663,10 @@ def run_auto_315_square_off():
 
         for tr in open_trades:
 
-            live_price = get_live_price(tr.symbol, tr.buy_price)
+            live_price = get_live_price(tr.symbol)
+            if live_price is None:
+                print(f"[AUTO 3:15 PM] Skipping {tr.symbol}: live quote unavailable.")
+                continue
             exit_price = live_price
 
             tr.sell_price = exit_price
@@ -923,10 +933,15 @@ def trigger_daily_trades(
 
     current_time_str = get_current_time()
 
-    symbol_prices = {
-        stock.symbol: get_symbol_seed_price(stock.symbol)
-        for stock in stocks
-    }
+    symbol_prices = {stock.symbol: get_live_price(stock.symbol) for stock in stocks}
+    unavailable_symbols = [
+        symbol for symbol, price in symbol_prices.items() if price is None
+    ]
+    if unavailable_symbols:
+        raise HTTPException(
+            status_code=503,
+            detail="Live quotes unavailable for: " + ", ".join(unavailable_symbols),
+        )
 
     for user in users:
 
@@ -941,10 +956,7 @@ def trigger_daily_trades(
 
         for stock in stocks:
 
-            cmp = symbol_prices.get(
-                stock.symbol,
-                get_symbol_seed_price(stock.symbol),
-            )
+            cmp = symbol_prices[stock.symbol]
 
             qty = max(
                 1,
@@ -1112,17 +1124,7 @@ def get_user_ledger(
         current_ltp = (
             t.sell_price
             if t.status == "CLOSED"
-            else round(
-                t.buy_price
-                * (
-                    1
-                    + random.uniform(
-                        -0.015,
-                        0.025,
-                    )
-                ),
-                2,
-            )
+            else get_live_price(t.symbol)
         )
 
         unrealized_pnl = (
@@ -1134,6 +1136,8 @@ def get_user_ledger(
                 * t.quantity,
                 2,
             )
+            if t.status == "OPEN" and current_ltp is not None
+            else None
             if t.status == "OPEN"
             else t.pnl
         )
@@ -1151,6 +1155,13 @@ def get_user_ledger(
                 "sell_price": t.sell_price,
                 "exit_time": t.exit_time or "-",
                 "current_ltp": current_ltp,
+                "price_source": (
+                    "CLOSED"
+                    if t.status == "CLOSED"
+                    else "LIVE"
+                    if current_ltp is not None
+                    else "UNAVAILABLE"
+                ),
                 "quantity": t.quantity,
                 "invested_margin": t.invested_margin,
                 "pnl": unrealized_pnl,
@@ -1824,10 +1835,15 @@ def trigger_920_entry(
 
     buy_time = get_current_time()
 
-    symbol_prices = {
-        stock.symbol: get_symbol_seed_price(stock.symbol)
-        for stock in stocks
-    }
+    symbol_prices = {stock.symbol: get_live_price(stock.symbol) for stock in stocks}
+    unavailable_symbols = [
+        symbol for symbol, price in symbol_prices.items() if price is None
+    ]
+    if unavailable_symbols:
+        raise HTTPException(
+            status_code=503,
+            detail="Live quotes unavailable for: " + ", ".join(unavailable_symbols),
+        )
 
     for user in users:
 
@@ -1842,10 +1858,7 @@ def trigger_920_entry(
 
         for st in stocks:
 
-            cmp = symbol_prices.get(
-                st.symbol,
-                get_symbol_seed_price(st.symbol),
-            )
+            cmp = symbol_prices[st.symbol]
 
             qty = max(
                 1,

@@ -1,5 +1,6 @@
 import os
 import time
+from functools import lru_cache
 from typing import Dict, Optional
 
 import requests
@@ -23,14 +24,53 @@ def _get_upstox_config() -> Dict[str, Optional[str]]:
     }
 
 
+@lru_cache(maxsize=1024)
+def _resolve_instrument_key(symbol: str, access_token: str) -> Optional[str]:
+    symbol_key = (symbol or "").strip().upper()
+    if not symbol_key:
+        return None
+    if "|" in symbol_key:
+        return symbol_key
+
+    query = symbol_key.removesuffix("-EQ")
+    try:
+        response = requests.get(
+            f"{UPSTOX_BASE_URL}/instruments/search",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            },
+            params={
+                "query": query,
+                "exchanges": "NSE",
+                "segments": "EQ",
+                "records": 30,
+            },
+            timeout=10,
+        )
+        if response.status_code != 200:
+            print(f"[UPSTOX INSTRUMENT SEARCH ERROR] {response.status_code}: {response.text[:200]}")
+            return None
+
+        instruments = response.json().get("data", [])
+        for instrument in instruments:
+            trading_symbol = str(instrument.get("trading_symbol", "")).upper()
+            if (
+                instrument.get("segment") == "NSE_EQ"
+                and trading_symbol == query
+                and instrument.get("instrument_key")
+            ):
+                return str(instrument["instrument_key"])
+    except Exception as exc:
+        print(f"[UPSTOX INSTRUMENT SEARCH ERROR] {symbol}: {exc}")
+
+    return None
+
+
 def get_live_ltp(symbol: str) -> Optional[float]:
     """
-    Upstox se live LTP fetch karta hai.
-    Dummy mode me iska use nahi hota.
+    Upstox se live LTP fetch karta hai; quote reads independent of order mode hain.
     """
-    if get_broker_mode() != "LIVE":
-        return None
-
     symbol_key = (symbol or "").strip()
     if not symbol_key:
         return None
@@ -41,9 +81,10 @@ def get_live_ltp(symbol: str) -> Optional[float]:
         return None
 
     try:
-        instrument_key = symbol_key.upper()
-        if "|" not in instrument_key:
-            instrument_key = f"NSE_EQ|{instrument_key}"
+        instrument_key = _resolve_instrument_key(symbol_key, access_token)
+        if not instrument_key:
+            print(f"[UPSTOX LTP ERROR] Could not resolve NSE instrument: {symbol}")
+            return None
 
         response = requests.get(
             f"{UPSTOX_BASE_URL}/market-quote/ltp",
@@ -61,14 +102,22 @@ def get_live_ltp(symbol: str) -> Optional[float]:
 
         payload = response.json()
         quote = payload.get("data", {})
-        if isinstance(quote, dict):
-            price = quote.get("ltp") or quote.get("last_price") or quote.get("last_traded_price")
-            if price is not None:
-                return float(price)
+        if isinstance(quote, dict) and "last_price" in quote:
+            quote_items = [quote]
+        elif isinstance(quote, dict):
+            quote_items = list(quote.values())
+        elif isinstance(quote, list):
+            quote_items = quote
+        else:
+            quote_items = []
 
-        if isinstance(quote, list) and quote:
-            first = quote[0]
-            price = first.get("ltp") or first.get("last_price") or first.get("last_traded_price")
+        for item in quote_items:
+            if not isinstance(item, dict):
+                continue
+            returned_key = str(item.get("instrument_token", "")).upper()
+            if returned_key and returned_key != instrument_key.upper():
+                continue
+            price = item.get("last_price") or item.get("ltp") or item.get("last_traded_price")
             if price is not None:
                 return float(price)
 
